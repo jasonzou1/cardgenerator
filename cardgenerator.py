@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext
+from tkinter import filedialog, messagebox, scrolledtext, ttk
 import threading
 import pandas as pd
 import os
@@ -14,12 +14,10 @@ from openai import OpenAI
 # ================= Configuration =================
 class Config:
     SPLIT_ANCHOR = "RECIPIENT FULL ADDRESS" 
-    COL_IDX_ADDRESS = 3  # Column D
-    COL_IDX_MESSAGE = 8  # Column I
+    COL_IDX_ADDRESS = 3  # Column D (Index 3)
+    COL_IDX_MESSAGE = 8  # Column I (Index 8)
     
-    # Garbage Filter (Skip these rows)
     IGNORE_KEYWORDS = [
-        "recipient full address",
         "form instructions",
         "basket name",
         "delivery date",
@@ -27,7 +25,6 @@ class Config:
         "must be a valid address"
     ]
     
-    # User Blacklist (Do not generate cards for these)
     USER_BLACKLIST = [
         "750 millway", 
         "my baskets", 
@@ -36,8 +33,9 @@ class Config:
 
 # ================= Logic Class =================
 class CardGenerator:
-    def __init__(self, log_callback):
+    def __init__(self, log_callback, progress_callback):
         self.log = log_callback
+        self.progress_cb = progress_callback
         self.api_key = None
         self.base_url = None
         self.model_name = "gpt-3.5-turbo"
@@ -54,30 +52,26 @@ class CardGenerator:
             if kw in t: return True
         return False
 
-    def _looks_like_phone(self, text):
-        t = text.lower().strip()
-        if "tel" in t or "phone" in t: return True
-        clean_nums = re.sub(r'[\d\-\(\)\.\+\s]', '', t)
-        if len(clean_nums) == 0 and len(t) > 5: return True
-        if len(t) > 0 and t[0].isdigit(): return True
-        return False
-
     def _clean_labels(self, text):
-        """
-        Removes 'Phone:', 'TEL:', etc. from the text, keeping the numbers.
-        """
         lines = text.split('\n')
         cleaned_lines = []
         for line in lines:
-            # Regex to remove "Tel:", "Phone:", "Ph." at the start of the line (case insensitive)
-            # Replaces "Phone: 123-456" with "123-456"
             new_line = re.sub(r'(?i)^\s*(tel|phone|ph|mobile|cell)[:\.]?\s*', '', line)
-            if new_line.strip():
+            if new_line.strip() and new_line.strip() not in [",", ".", "-"]:
                 cleaned_lines.append(new_line)
         return "\n".join(cleaned_lines)
 
+    def _is_ai_chatting(self, response_text):
+        bad_starts = ["sure!", "sure,", "here is", "please provide", "i cannot", "sorry", "certainly"]
+        lower_resp = response_text.lower().strip()
+        for bad in bad_starts:
+            if lower_resp.startswith(bad):
+                return True
+        return False
+
+    # --- AI: Format Address ---
     def ai_format_block(self, raw_text):
-        if not self.api_key: return raw_text
+        if not self.api_key or len(raw_text.strip()) < 5: return raw_text
         try:
             client = OpenAI(api_key=self.api_key, base_url=self.base_url)
             prompt = f"""
@@ -87,111 +81,187 @@ class CardGenerator:
             {raw_text}
             ---
             Rules:
-            1. STRICTLY REMOVE all labels like "TEL:", "Phone:", "Attention:". Just keep the value.
-            2. Do not write "[insert phone number]". If no number exists, leave it blank.
-            3. Put the phone number on the last line.
-            4. Output plain text only.
+            1. STRICTLY REMOVE labels like "TEL:", "Attention:". Keep only values.
+            2. Do not write "[insert number]".
+            3. Put phone number on the last line.
+            4. Output plain text only. 
+            5. IF INPUT IS EMPTY OR NONSENSE, RETURN EMPTY STRING.
             """
             response = client.chat.completions.create(
                 model=self.model_name,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1
             )
-            return response.choices[0].message.content.strip()
+            result = response.choices[0].message.content.strip()
+            if self._is_ai_chatting(result): return raw_text
+            return result
         except Exception as e:
-            self.log(f"AI Error: {e}")
+            self.log(f"AI Address Error: {e}")
             return raw_text
 
+    # --- AI: Format Message ---
+    def ai_format_message(self, raw_msg):
+        if not self.api_key or len(raw_msg.strip()) < 2: return raw_msg
+        try:
+            client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+            prompt = f"""
+            Refine this Gift Card Message which was split across multiple Excel rows.
+            Input:
+            ---
+            {raw_msg}
+            ---
+            Rules:
+            1. Merge broken sentences into a single coherent paragraph.
+            2. Keep the "From: [Name]" or "Love, [Name]" on a separate line at the bottom.
+            3. Fix spacing and punctuation.
+            4. Do NOT add quotes or conversational text.
+            """
+            response = client.chat.completions.create(
+                model=self.model_name,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3
+            )
+            result = response.choices[0].message.content.strip()
+            if self._is_ai_chatting(result): return raw_msg
+            return result
+        except Exception as e:
+            self.log(f"AI Message Error: {e}")
+            return raw_msg
+
+    # ================= STRICT GRID LOGIC (V15) =================
     def read_excel_strict(self, file_path):
-        self.log(f"Reading file: {os.path.basename(file_path)}...")
+        self.log(f"Reading file (Strict Grid Mode): {os.path.basename(file_path)}...")
+        self.progress_cb(0)
+        
         try:
             df = pd.read_excel(file_path, header=None, dtype=str)
+            total_rows = len(df)
             
-            start_row = 0
+            # Find First Anchor (Start Point)
+            start_idx = 0
+            found = False
             for r in range(len(df)):
                 val = str(df.iloc[r, Config.COL_IDX_ADDRESS]).strip()
                 if Config.SPLIT_ANCHOR.lower() in val.lower():
-                    start_row = r
-                    self.log(f"✅ Found anchor at Row {r+1}")
+                    start_idx = r
+                    found = True
                     break
+            
+            if not found:
+                self.log("❌ Could not find 'RECIPIENT FULL ADDRESS' header.")
+                return []
 
             parsed_cards = []
-            current_addr_lines = []
-            current_msg = ""
-            empty_gap = 0
             
-            # === Reading Loop ===
-            for i in range(start_row + 1, len(df)):
-                raw_addr = str(df.iloc[i, Config.COL_IDX_ADDRESS]).strip()
-                if raw_addr.lower() == 'nan': raw_addr = ""
+            # Start logic:
+            # If we found header at Row X, the first person starts at X+1.
+            current_row = start_idx 
+            
+            while current_row < total_rows:
+                # Update Progress
+                prog_val = (current_row / total_rows) * 100
+                self.progress_cb(prog_val)
+
+                # --- 1. Header Check (Reset Point) ---
+                # Check if the CURRENT row is a header
+                cell_val = str(df.iloc[current_row, Config.COL_IDX_ADDRESS]).strip()
+                if Config.SPLIT_ANCHOR.lower() in cell_val.lower():
+                    self.log(f"🔄 Header found at Row {current_row+1}. Resetting alignment.")
+                    current_row += 1  # Move to the row immediately after header (D65 -> D66)
+                    continue
+
+                # --- 2. Safety: Look Ahead inside the block ---
+                # Before we blindly grab 5 rows, make sure a Header isn't lurking inside them.
+                # Example: We only have 3 rows of data, then a new header appears.
+                rows_to_check = 5
+                if current_row + 5 > total_rows:
+                    rows_to_check = total_rows - current_row
+
+                header_interruption_offset = -1
+                for offset in range(rows_to_check):
+                    r_check = current_row + offset
+                    val_check = str(df.iloc[r_check, Config.COL_IDX_ADDRESS]).strip()
+                    if Config.SPLIT_ANCHOR.lower() in val_check.lower():
+                        header_interruption_offset = offset
+                        break
                 
-                raw_msg = str(df.iloc[i, Config.COL_IDX_MESSAGE]).strip()
-                if raw_msg.lower() == 'nan': raw_msg = ""
+                if header_interruption_offset != -1:
+                    # A header cut us off! Jump directly to that header and restart loop.
+                    # This handles incomplete blocks (e.g., only 3 lines of data then header).
+                    self.log(f"⚠️ Block interrupted by header at Row {current_row + header_interruption_offset + 1}.")
+                    current_row += header_interruption_offset
+                    continue
 
-                if self._is_garbage(raw_addr): continue
+                # --- 3. Strict Extraction ---
+                # If we are here, the next 5 rows are safe (or until EOF).
+                block_addr_lines = []
+                block_msg_lines = []
+                is_block_empty = True
 
-                is_new_person = False
-                if raw_msg: 
-                    is_new_person = True
-                elif raw_addr:
-                    if not self._looks_like_phone(raw_addr) and empty_gap >= 2:
-                        is_new_person = True
+                for k in range(5):
+                    r_idx = current_row + k
+                    if r_idx >= total_rows: break # EOF safety
 
-                if is_new_person and current_addr_lines:
-                    self._add_card(parsed_cards, current_addr_lines, current_msg)
-                    current_addr_lines = []
-                    current_msg = ""
-                    empty_gap = 0
+                    raw_a = str(df.iloc[r_idx, Config.COL_IDX_ADDRESS]).strip()
+                    if raw_a.lower() == 'nan': raw_a = ""
+                    
+                    raw_m = str(df.iloc[r_idx, Config.COL_IDX_MESSAGE]).strip()
+                    if raw_m.lower() == 'nan': raw_m = ""
 
-                if is_new_person:
-                    current_addr_lines.append(raw_addr)
-                    current_msg = raw_msg
-                    empty_gap = 0
-                else:
-                    if raw_addr:
-                        current_addr_lines.append(raw_addr)
-                        if raw_msg and not current_msg: current_msg = raw_msg
-                        empty_gap = 0
-                    else:
-                        empty_gap += 1
+                    if raw_a or raw_m: is_block_empty = False
+                    if raw_a: block_addr_lines.append(raw_a)
+                    if raw_m: block_msg_lines.append(raw_m)
 
-            if current_addr_lines:
-                self._add_card(parsed_cards, current_addr_lines, current_msg)
+                # If the block has data, process it.
+                if not is_block_empty:
+                    full_addr = "\n".join(block_addr_lines)
+                    full_msg = "\n".join(block_msg_lines)
+                    # Simple validation: Address needs to be substantial
+                    if self._validate_block(full_addr):
+                        self._add_card_to_list(parsed_cards, full_addr, full_msg)
 
-            # === Final Cleaning (Remove short/empty addresses) ===
-            final_cards = []
-            for card in parsed_cards:
-                addr_clean = card['address'].strip().replace('\n', '')
-                if len(addr_clean) > 5:
-                    final_cards.append(card)
+                # --- 4. Move Forward Strictly ---
+                # Regardless of whether it was empty or full, we strictly move 5 rows.
+                current_row += 5
 
-            self.log(f"📊 Extraction Complete. Valid Cards: {len(final_cards)}")
-            return final_cards
+            self.progress_cb(100)
+            self.log(f"📊 Extraction Complete. Valid Cards: {len(parsed_cards)}")
+            return parsed_cards
 
         except Exception as e:
             self.log(f"❌ Error Reading File: {e}")
+            import traceback
+            traceback.print_exc()
             return []
 
-    def _add_card(self, card_list, lines, msg):
-        full_text = "\n".join(lines)
-        
-        # Blacklist check
+    def _validate_block(self, addr_text):
+        if len(addr_text) < 5: return False 
+        if self._is_garbage(addr_text): return False
+        # Must contain digits (zip code or phone) to be a valid address block
+        if not any(char.isdigit() for char in addr_text): return False
+        return True
+
+    def _add_card_to_list(self, card_list, raw_addr, raw_msg):
+        clean_addr = self._clean_labels(raw_addr)
         for bw in Config.USER_BLACKLIST:
-            if bw in full_text.lower(): return
-        
-        # 1. Programmatic cleaning (Remove "Phone:" prefix)
-        full_text = self._clean_labels(full_text)
+            if bw in clean_addr.lower(): return
 
-        # 2. AI formatting (Optional)
+        final_addr = clean_addr
+        final_msg = raw_msg
+
         if self.api_key:
-            full_text = self.ai_format_block(full_text)
-            # Clean again in case AI added labels back (rare but possible)
-            full_text = self._clean_labels(full_text)
+            if len(clean_addr) > 5:
+                ai_a = self.ai_format_block(clean_addr)
+                if ai_a: final_addr = ai_a
+                final_addr = self._clean_labels(final_addr)
 
-        card_list.append({'address': full_text, 'message': msg})
+            if len(raw_msg.strip()) > 2:
+                ai_m = self.ai_format_message(raw_msg)
+                if ai_m: final_msg = ai_m
+
+        card_list.append({'address': final_addr, 'message': final_msg})
 
     def generate_word(self, data_list, output_path):
-        """Word Generation (English Logs + Arial + Size Limits)"""
         if not data_list: return
 
         self.log("Generating Word Document...")
@@ -203,7 +273,6 @@ class CardGenerator:
         section.top_margin = margin; section.bottom_margin = margin
         section.left_margin = margin; section.right_margin = margin
 
-        # Row Height: 6.75cm (Prevent Overflow)
         ROW_HEIGHT = Cm(6.75)
         COL_WIDTH = Cm(9.5)
 
@@ -227,7 +296,7 @@ class CardGenerator:
             for i, item in enumerate(page_data):
                 row = table.rows[i]
                 
-                # === Left: Address (Left Align, Arial, 10.5pt) ===
+                # Address
                 cell_l = row.cells[0]
                 cell_l.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
                 p_l = cell_l.paragraphs[0]
@@ -237,33 +306,30 @@ class CardGenerator:
                     run_l = p_l.runs[0]
                     run_l.font.name = 'Arial' 
                     run_l.font.size = Pt(10.5) 
+                    if i == 3: p_l.paragraph_format.space_before = Pt(28)
                 
-                # === Right: Message (Center, Arial, 10-16pt) ===
+                # Message
                 cell_r = row.cells[1]
                 cell_r.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
                 p_r = cell_r.paragraphs[0]
                 p_r.text = item['message']
                 p_r.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                if i == 3: p_r.paragraph_format.space_before = Pt(28)
+
                 if p_r.runs:
                     run_r = p_r.runs[0]
                     run_r.font.name = 'Arial'
-                    
-                    # Smart Sizing
                     length = len(item['message'])
-                    if length < 30:
-                        run_r.font.size = Pt(16) # Max
-                    elif length < 80:
-                        run_r.font.size = Pt(13) # Mid
-                    else:
-                        run_r.font.size = Pt(10) # Min
+                    if length < 30: run_r.font.size = Pt(16)
+                    elif length < 80: run_r.font.size = Pt(13)
+                    else: run_r.font.size = Pt(10)
 
-            if page_idx < total_pages - 1: 
-                doc.add_page_break()
+            if page_idx < total_pages - 1: doc.add_page_break()
         
         try:
             doc.save(output_path)
             self.log(f"✅ Saved Successfully: {output_path}")
-            messagebox.showinfo("Success", "Processing Complete!\n- Font: Arial\n- Labels Removed\n- Blank Pages Removed")
+            messagebox.showinfo("Success", "Processing Complete!")
         except Exception as e:
             self.log(f"❌ Error Saving File: {e}")
 
@@ -271,15 +337,15 @@ class CardGenerator:
 class App:
     def __init__(self, root):
         self.root = root
-        self.root.title("Card Generator (V9 English)")
-        self.root.geometry("650x600")
+        self.root.title("Card Generator (V15 - Strict Grid Mode)")
+        self.root.geometry("650x700")
         
         self.api_key = tk.StringVar()
         self.base_url = tk.StringVar()
         self.model_name = tk.StringVar(value="gpt-3.5-turbo") 
         self.file_path = tk.StringVar()
         
-        self.logic = CardGenerator(self.log_msg)
+        self.logic = CardGenerator(self.log_msg, self.update_progress)
         self._load_config()
         self._setup_ui()
 
@@ -302,8 +368,7 @@ class App:
             }, f)
 
     def _setup_ui(self):
-        # AI Config
-        f_ai = tk.LabelFrame(self.root, text="AI Settings (Optional)", padx=10, pady=10)
+        f_ai = tk.LabelFrame(self.root, text="AI Settings", padx=10, pady=10)
         f_ai.pack(fill="x", padx=10, pady=5)
         
         tk.Label(f_ai, text="API Key:").grid(row=0, column=0, sticky="e")
@@ -313,17 +378,20 @@ class App:
         tk.Label(f_ai, text="Model:").grid(row=2, column=0, sticky="e")
         tk.Entry(f_ai, textvariable=self.model_name, width=40).grid(row=2, column=1, padx=5, pady=2)
 
-        # File
         f_file = tk.LabelFrame(self.root, text="File Selection", padx=10, pady=10)
         f_file.pack(fill="x", padx=10, pady=5)
         tk.Entry(f_file, textvariable=self.file_path, width=50).pack(side="left")
         tk.Button(f_file, text="Browse Excel", command=self.sel_file).pack(side="left", padx=5)
 
-        # Run Button
+        f_prog = tk.Frame(self.root, padx=10, pady=5)
+        f_prog.pack(fill="x")
+        tk.Label(f_prog, text="Processing Progress:").pack(anchor="w")
+        self.progress_bar = ttk.Progressbar(f_prog, orient="horizontal", length=100, mode="determinate")
+        self.progress_bar.pack(fill="x", pady=2)
+
         tk.Button(self.root, text="🚀 Start Processing", command=self.run_thread, 
                   bg="#28a745", fg="white", font=("Arial", 12, "bold"), height=2).pack(fill="x", padx=20, pady=10)
 
-        # Log Area
         self.log_area = scrolledtext.ScrolledText(self.root, height=15)
         self.log_area.pack(fill="both", expand=True, padx=10, pady=5)
 
@@ -335,8 +403,12 @@ class App:
         self.root.after(0, lambda: self.log_area.insert(tk.END, f">> {msg}\n"))
         self.root.after(0, lambda: self.log_area.see(tk.END))
 
+    def update_progress(self, val):
+        self.root.after(0, lambda: self.progress_bar.configure(value=val))
+
     def run_thread(self):
         self._save_config()
+        self.progress_bar['value'] = 0 
         threading.Thread(target=self.run, daemon=True).start()
 
     def run(self):
@@ -346,7 +418,7 @@ class App:
         data = self.logic.read_excel_strict(f)
         if data:
             base = os.path.splitext(f)[0]
-            out = f"{base}_English_V9.docx"
+            out = f"{base}_English_V15_Strict.docx"
             self.logic.generate_word(data, out)
 
 if __name__ == "__main__":
